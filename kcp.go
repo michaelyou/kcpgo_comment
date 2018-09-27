@@ -91,20 +91,59 @@ func _itimediff(later, earlier uint32) int32 {
 	return (int32)(later - earlier)
 }
 
-// segment defines a KCP segment
+/*
+segment defines a KCP segment
+
+下面是segment的类型及说明
+1. 数据包
+最基础的Segment，用于发送应用层数据给远端。 每个数据包会有自己的sn， 发送出去后不会立即从缓存池中删除，而是会等收到远端返回回来的ack包时才会从缓存中移除（两端通过sn确认哪些包已收到）
+
+2 ACK包
+告诉远端自己已收到了远端发送的某个数据包。
+
+3 窗口大小探测包
+询问远端的接收窗口大小。 本地发送数据时，会根据远端的窗口大小来控制发送的数据量。
+每个数据包的包头中都会带有远端当前的接收窗口大小。 但是当远端的接收窗口大小为0时，本机将不会再向远端发送数据，此时也就不会有远端的回传数据从而导致无法更新远端窗口大小。
+因此需要单独的一类远端窗口大小探测包，在远端接收窗口大小为0时，隔一段时间询问一次，从而让本地有机会再开始重新传数据。
+
+4 窗口大小回应包
+回应远端自己的数据接收窗口大小。
+*/
 type segment struct {
-	conv     uint32
-	cmd      uint8
-	frg      uint8
-	wnd      uint16
-	ts       uint32
-	sn       uint32
-	una      uint32
-	rto      uint32
-	xmit     uint32
+	// 发送端与接收端通信时的匹配数字，发送端发送的数据包中此值与接收端的conv值匹配一致时，接收端才会接受此包。
+	// conv为一个表示会话编号的整数，和tcp的conv一样，通信双方需保证conv相同，相互的数据包才能够被认可
+	conv uint32
+	// cmd是command的缩写,指明Segment类型。 Segment类型有以下几种：
+	// 1. IKCP_CMD_PUSH : 发送数据包给远端
+	// 2. IKCP_CMD_ACK : ACK包，告诉远端自己收到了哪个数据包
+	// 3. IKCP_CMD_WASK : 询问远端的数据接收窗口还剩余多少
+	// 4. IKCP_CMD_WINS : 回应远端自己的数据接收窗口大小
+	cmd uint8
+	// frg是fragment的缩写，是一个Segment在一次Send的data中的倒序序号。
+	// 在让KCP发送数据时，KCP会加入snd_queue的Segment分配序号，标记Segment是这次发送数据中的倒数第几个Segment。
+	// 数据在发送出去时，由于mss的限制，数据可能被分成若干个Segment发送出去。在分segment的过程中，相应的序号就会被记录到frg中。
+	// 接收端在接收到这些segment时，就会根据frg将若干个segment合并成一个，再返回给应用层。
+	frg uint8
+	// wnd是window的缩写； 滑动窗口大小，用于流控（Flow Control）
+	// * 当Segment做为发送数据时，此wnd为本机滑动窗口大小，用于告诉远端自己窗口剩余多少
+	// * 当Segment做为接收到数据时，此wnd为远端滑动窗口大小，本机知道了远端窗口剩余多少后，可以控制自己接下来发送数据的大小
+	wnd uint16
+	// timestamp, 当前Segment发送时的时间戳
+	ts uint32
+	// Sequence Number, Segment的编号
+	sn uint32
+	// unacknowledged, 表示此编号前的所有包都已收到了。
+	una uint32
+	// Retransmission TimeOut，即超时重传时间，在发送出去时根据之前的网络情况进行设置
+	rto uint32
+	// 基本类似于Segment发送的次数，每发送一次会自加一。用于统计该Segment被重传了几次，用于参考，进行调节
+	xmit uint32
+	// resend timestamp , 指定重发的时间戳，当当前时间超过这个时间时，则再重发一次这个包
 	resendts uint32
-	fastack  uint32
-	data     []byte
+	// 用于以数据驱动的快速重传机制
+	fastack uint32
+	// 数据
+	data []byte
 }
 
 // encode a segment into buffer
@@ -123,25 +162,39 @@ func (seg *segment) encode(ptr []byte) []byte {
 
 // KCP defines a single KCP connection
 type KCP struct {
-	conv, mtu, mss, state                  uint32
-	snd_una, snd_nxt, rcv_nxt              uint32
-	ssthresh                               uint32
-	rx_rttvar, rx_srtt                     int32
-	rx_rto, rx_minrto                      uint32
-	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe uint32
-	interval, ts_flush                     uint32
-	nodelay, updated                       uint32
-	ts_probe, probe_wait                   uint32
-	dead_link, incr                        uint32
+	conv, mtu, mss, state uint32 // conv：回话id
+	// 当前未收到确认回传的发送出去的包的最小编号。也就是此编号前的包都已经收到确认回传了
+	snd_una uint32
+	snd_nxt uint32 // 下一个要发送出去的包编号
+	// 下一个要接收的数据包的编号。也就是说此序号之前的包都已经按顺序全部收到了，下面期望收到这个序号的包（已保证数据包的连续性、顺序性
+	rcv_nxt              uint32
+	ssthresh             uint32
+	rx_rttvar, rx_srtt   int32
+	rx_rto, rx_minrto    uint32 // tx_rto：由ack接收延迟计算出来的超时重传时间
+	snd_wnd              uint32 // 发送窗口大小
+	rmt_wnd              uint32 // 远端的接收窗口大小, rmt是remote
+	rcv_wnd              uint32 // 接收窗口大小
+	cwnd, probe          uint32
+	interval, ts_flush   uint32
+	nodelay, updated     uint32 // nodelay：0-表示不启动快速重传模式
+	ts_probe, probe_wait uint32
+	dead_link, incr      uint32
 
 	fastresend     int32
 	nocwnd, stream int32
-
+	// 发送队列。应用层的数据（在调用KCP.Send后）会进入此队列中，KCP在flush的时候根据发送窗口的大小，再决定将多少个Segment放入到snd_buf中进行发送
 	snd_queue []segment
+	// 缓存 接收到的连续的数据包
 	rcv_queue []segment
-	snd_buf   []segment
-	rcv_buf   []segment
+	// 发送缓存池。发送出去的数据将会呆在这个池子中，等待远端的回传确认，等收到远端确认此包收到后再从snd_buf移出去。
+	// KCP在每次flush的时候都会检查这个缓存池中的每个Segment，如果超时或者判定丢包就会重发。
+	snd_buf []segment
+	// 接收到的数据会先存放到rcv_buf中。 因为数据可能是乱序到达本地的，所以接受到的数据会按sn顺序依次放入到对应的位置中。
+	// 当sn从低到高连续的数据包都收到了，则将这批连续的数据包转移到rcv_queue中。这样就保证了数据包的顺序性。
+	rcv_buf []segment
 
+	// 收到包后要发送的回传确认。 在收到包时先将要回传ack的sn放入此队列中，在flush函数中再发出去。
+	// acklist中，一个ack以(sn,timestampe)为一组的方式存储。即 [{sn1,ts1},{sn2,ts2} … ] 即 [sn1,ts1,sn2,ts2 … ]
 	acklist []ackItem
 
 	buffer []byte
@@ -510,6 +563,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			return -1
 		}
 
+		// 解析出数据中的KCP头部
 		data = ikcp_decode8u(data, &cmd)
 		data = ikcp_decode8u(data, &frg)
 		data = ikcp_decode16u(data, &wnd)
@@ -528,14 +582,22 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 
 		// only trust window updates from regular packets. i.e: latest update
 		if regular {
+			// 获得远端的窗口大小
 			kcp.rmt_wnd = uint32(wnd)
 		}
+		// 分析una，看哪些segment远端收到了，把远端收到的segment从snd_buf中移除
 		kcp.parse_una(una)
 		kcp.shrink_buf()
 
 		if cmd == IKCP_CMD_ACK {
+			// 如果收到的是远端发来的ACK包
+
+			// 分析具体是哪个segment被收到了，将其从snd_buf中移除
+			// 同时给snd_buf中的其它segment的fastack字段增加计数++
 			kcp.parse_ack(sn)
+			// 因为snd_buf可能改变了，更新当前的snd_una
 			kcp.shrink_buf()
+			// 因为此时收到远端的ack，所以我们知道远端的包到本机的时间，因此可统计当前的网速如何，进行调整。这里是可以更新rto的，但是没有看到代码
 			if flag == 0 {
 				flag = 1
 				maxack = sn
@@ -545,9 +607,14 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 				lastackts = ts
 			}
 		} else if cmd == IKCP_CMD_PUSH {
+			// 如果收到的是远端发来的数据包
+
+			// 如果还有足够多的接收窗口
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
+				// push当前包的ack给远端（会在flush中发送ack出去)
 				kcp.ack_push(sn, ts)
 				if _itimediff(sn, kcp.rcv_nxt) >= 0 {
+					// 如果当前segment还没被接收过sn >= rcv_next
 					seg := kcp.newSegment(int(length))
 					seg.conv = conv
 					seg.cmd = cmd
@@ -557,27 +624,36 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 					seg.sn = sn
 					seg.una = una
 					copy(seg.data, data[:length])
+					// 根据segment.sn分析当前segment与rcv_buf中的那些segment的关系
+					// 1. 如果已经接收过了，则丢弃
+					// 2. 否则将其按sn的顺序插入到rcv_buf中对应的位置中去
+					// 3. 按顺序将sn连续在一起的segment转移转移到rcv_queue中
 					kcp.parse_data(seg)
 				} else {
+					// 重复的包，丢弃
 					atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
 				}
 			} else {
 				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
 			}
 		} else if cmd == IKCP_CMD_WASK {
+			// 如果收到的包是远端发过来询问窗口大小的包
+
 			// ready to send back IKCP_CMD_WINS in Ikcp_flush
 			// tell remote my window size
 			kcp.probe |= IKCP_ASK_TELL
 		} else if cmd == IKCP_CMD_WINS {
 			// do nothing
 		} else {
-			return -3
+			return -3 // 不接受其他命令
 		}
 
 		inSegs++
 		data = data[length:]
 	}
 	atomic.AddUint64(&DefaultSnmp.InSegs, inSegs)
+
+	// 根据收到包头的信息，更新网络情况的统计数据，方便进行流控
 
 	if flag != 0 && regular {
 		kcp.parse_fastack(maxack)
@@ -632,6 +708,7 @@ func (kcp *KCP) flush(ackOnly bool) {
 
 	buffer := kcp.buffer
 	// flush acknowledges
+	// 将前面收到数据时，压进ack发送队列的ack发送出去
 	ptr := buffer
 	for i, ack := range kcp.acklist {
 		size := len(buffer) - len(ptr)
@@ -656,6 +733,7 @@ func (kcp *KCP) flush(ackOnly bool) {
 	}
 
 	// probe window size (if remote window size equals zero)
+	// 在远端窗口大小为0时，探测远端窗口大小。为远端窗口大小为0时，远端已没有窗口可接收数据，此时不该再发，会造成远端处理不过来
 	if kcp.rmt_wnd == 0 {
 		current := currentMs()
 		if kcp.probe_wait == 0 {
@@ -710,9 +788,10 @@ func (kcp *KCP) flush(ackOnly bool) {
 	}
 
 	// sliding window, controlled by snd_nxt && sna_una+cwnd
+	// 转移snd_queue中的数据到snd_buf中，以便后面发送出去
 	newSegsCount := 0
 	for k := range kcp.snd_queue {
-		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
+		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 { // 已经没有发送窗口了，不发送新数据
 			break
 		}
 		newseg := kcp.snd_queue[k]
@@ -729,6 +808,7 @@ func (kcp *KCP) flush(ackOnly bool) {
 	}
 
 	// calculate resent
+	// 计算重传时间
 	resent := uint32(kcp.fastresend)
 	if kcp.fastresend <= 0 {
 		resent = 0xffffffff
@@ -737,14 +817,17 @@ func (kcp *KCP) flush(ackOnly bool) {
 	// check for retransmissions
 	current := currentMs()
 	var change, lost, lostSegs, fastRetransSegs, earlyRetransSegs uint64
+	// 根据各个segment的发送情况发送segment
 	for k := range kcp.snd_buf {
 		segment := &kcp.snd_buf[k]
 		needsend := false
 		if segment.xmit == 0 { // initial transmit
+			// 该segment是第一次发送，需要发送出去
 			needsend = true
 			segment.rto = kcp.rx_rto
 			segment.resendts = current + segment.rto
 		} else if _itimediff(current, segment.resendts) >= 0 { // RTO
+			// 当前时间已经到了该segment的重发时间（却还在snd_buf中，证明一直没收到该segment的ack，可认为这个segment丢了），也需要发送出去
 			needsend = true
 			if kcp.nodelay == 0 {
 				segment.rto += kcp.rx_rto
@@ -755,6 +838,10 @@ func (kcp *KCP) flush(ackOnly bool) {
 			lost++
 			lostSegs++
 		} else if segment.fastack >= resent { // fast retransmit
+			// 该segment的fastack大于resent了，也认为需要重发出去
+			// 1. fastack是个计数器，每次收到远端的ack包时，而该包又不属于自己的ack包时，该值就会加
+			// 2. resent由fastresend赋值，fastresend可由外部配置是否快速重传
+			// 3. 这个条件可加快丢包重传，但会浪费多点带宽（因为可能该segment只是到达的慢一点而已，这个会导致有更高的概率重传多次同一个segment）
 			needsend = true
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto

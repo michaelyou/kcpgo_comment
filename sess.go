@@ -1,3 +1,4 @@
+// 会话管理实现
 package kcp
 
 import (
