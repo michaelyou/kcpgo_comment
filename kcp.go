@@ -130,7 +130,8 @@ type segment struct {
 	wnd uint16
 	// timestamp, 当前Segment发送时的时间戳
 	ts uint32
-	// Sequence Number, Segment的编号
+	// Sequence Number, Segment的编号，sn和frg是完全不一样的，sn是一个全局的东西，通过kcp.snd_nxt赋值，
+	// 而frg是针对一个大的数据包切成多个segment的设定，用于将多个segment恢复成原始报文
 	sn uint32
 	// unacknowledged, 表示此编号前的所有包都已收到了。
 	una uint32
@@ -147,6 +148,22 @@ type segment struct {
 }
 
 // encode a segment into buffer
+/*
+|<------------ 4 bytes ------------>|
++--------+--------+--------+--------+
+|  conv                             | conv：Conversation, 会话序号，用于标识收发数据包是否一致
++--------+--------+--------+--------+ cmd: Command, 指令类型，代表这个Segment的类型
+|  cmd   |  frg   |  wnd            | frg: Fragment, 分段序号，分段从大到小，0代表数据包接收完毕
++--------+--------+--------+--------+ wnd: Window, 窗口大小
+|  ts                               | ts: Timestamp, 发送的时间戳
++--------+--------+--------+--------+
+|  sn                               | sn: Sequence Number, Segment序号
++--------+--------+--------+--------+
+|  una                              | una: Unacknowledged, 当前未收到的序号，
++--------+--------+--------+--------+      即代表这个序号之前的包均收到
+|  len                              | len: Length, 后续数据的长度
++--------+--------+--------+--------+
+*/
 func (seg *segment) encode(ptr []byte) []byte {
 	ptr = ikcp_encode32u(ptr, seg.conv)
 	ptr = ikcp_encode8u(ptr, seg.cmd)
@@ -162,23 +179,27 @@ func (seg *segment) encode(ptr []byte) []byte {
 
 // KCP defines a single KCP connection
 type KCP struct {
-	conv, mtu, mss, state uint32 // conv：回话id
+	// 回话id，需要两端保持一致，那么如何保持一致呢？
+	// server端的conv是client端带过去的，在Listener.monitor中，会用client的conv_id来创建UDPSession
+	conv            uint32
+	mtu, mss, state uint32
 	// 当前未收到确认回传的发送出去的包的最小编号。也就是此编号前的包都已经收到确认回传了
 	snd_una uint32
 	snd_nxt uint32 // 下一个要发送出去的包编号
 	// 下一个要接收的数据包的编号。也就是说此序号之前的包都已经按顺序全部收到了，下面期望收到这个序号的包（已保证数据包的连续性、顺序性
-	rcv_nxt              uint32
-	ssthresh             uint32
-	rx_rttvar, rx_srtt   int32
-	rx_rto, rx_minrto    uint32 // tx_rto：由ack接收延迟计算出来的超时重传时间
-	snd_wnd              uint32 // 发送窗口大小
-	rmt_wnd              uint32 // 远端的接收窗口大小, rmt是remote
-	rcv_wnd              uint32 // 接收窗口大小
-	cwnd, probe          uint32
-	interval, ts_flush   uint32
-	nodelay, updated     uint32 // nodelay：0-表示不启动快速重传模式
-	ts_probe, probe_wait uint32
-	dead_link, incr      uint32
+	rcv_nxt            uint32
+	ssthresh           uint32
+	rx_rttvar, rx_srtt int32
+	rx_rto, rx_minrto  uint32 // tx_rto：由ack接收延迟计算出来的超时重传时间
+	snd_wnd            uint32 // 发送窗口大小（窗口的计量单位是segment，不是字节）
+	rmt_wnd            uint32 // 远端的接收窗口大小, rmt是remote
+	rcv_wnd            uint32 // 接收窗口大小
+	cwnd, probe        uint32
+	interval, ts_flush uint32
+	nodelay, updated   uint32 // nodelay：0-表示不启动快速重传模式
+	ts_probe           uint32 // 下次窗口探测的时间
+	probe_wait         uint32
+	dead_link, incr    uint32
 
 	fastresend     int32
 	nocwnd, stream int32
@@ -197,8 +218,9 @@ type KCP struct {
 	// acklist中，一个ack以(sn,timestampe)为一组的方式存储。即 [{sn1,ts1},{sn2,ts2} … ] 即 [sn1,ts1,sn2,ts2 … ]
 	acklist []ackItem
 
+	// 真正要发送出去的payload
 	buffer []byte
-	output output_callback
+	output output_callback // 回调，真正发送数据的地方，底层协议的抽象比如（UDP）
 }
 
 type ackItem struct {
@@ -249,6 +271,7 @@ func (kcp *KCP) PeekSize() (length int) {
 		return len(seg.data)
 	}
 
+	// 下一个完整的包没有收全
 	if len(kcp.rcv_queue) < int(seg.frg+1) {
 		return -1
 	}
@@ -279,16 +302,22 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	}
 
 	var fast_recover bool
+	// 检查本次接收数据之后，是否需要进行窗口恢复。
+	// KCP 协议在远端窗口为0的时候将会停止发送数据，此时如果远端调用 recv 将数据从 rcv_buffer 中移动到应用层 queue 中之后，
+	// 表明其可以再次接受数据，为了能够恢复数据的发送，远端可以主动发送 IKCP_ASK_TELL 来告知窗口大小
 	if len(kcp.rcv_queue) >= int(kcp.rcv_wnd) {
 		fast_recover = true
 	}
 
 	// merge fragment
 	count := 0
+	// 开始将 rcv_queue 中的数据根据分片编号 frg merge 起来，然后拷贝到用户的 buffer 中。
+	// 这里循环遍历 rcv_queue，按序拷贝数据，当碰到某个 segment 的 frg 为 0 时跳出循环，表明本次数据接收结束，
+	// 这点应该很好理解，经过 send 发送的数据会进行分片，分片编号为倒序序号，因此 frg 为 0 的数据包标记着完整接收到了一次 send 发送过来的数据
 	for k := range kcp.rcv_queue {
 		seg := &kcp.rcv_queue[k]
 		copy(buffer, seg.data)
-		buffer = buffer[len(seg.data):]
+		buffer = buffer[len(seg.data):] // buffer是传进来的，容量管够(PeekSize)，这里看上去buffer变了，但是外部有buffer原始的首地址
 		n += len(seg.data)
 		count++
 		kcp.delSegment(*seg)
@@ -301,6 +330,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	}
 
 	// move available data from rcv_buf -> rcv_queue
+	// 将rcv_buf 中的数据转移到 rcv_queue 中，这个过程根据报文的 sn 编号来确保转移到 rcv_queue 中的数据一定是按序的，这里和parse_data中的最后一部分完全一样
 	count = 0
 	for k := range kcp.rcv_buf {
 		seg := &kcp.rcv_buf[k]
@@ -318,6 +348,8 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	}
 
 	// fast recover
+	// 最后进行窗口恢复。此时如果 recover 标记为1，表明在此次接收之前，可用接收窗口为0，如果经过本次接收之后，可用窗口大于0，
+	// 将主动发送 IKCP_ASK_TELL 数据包来通知对方已可以接收数据
 	if len(kcp.rcv_queue) < int(kcp.rcv_wnd) && fast_recover {
 		// ready to send back IKCP_CMD_WINS in ikcp_flush
 		// tell remote my window size
@@ -327,6 +359,8 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 }
 
 // Send is user/upper level send, returns below zero for error
+// Send确实是一个上层API(相对于flush等)，但是并不能称为一个user level的API，在kcp的使用中，用户能接触到的是
+// UDPSession，而不会直接调用KCP的方法
 func (kcp *KCP) Send(buffer []byte) int {
 	var count int
 	if len(buffer) == 0 {
@@ -334,6 +368,9 @@ func (kcp *KCP) Send(buffer []byte) int {
 	}
 
 	// append to previous segment in streaming mode (if possible)
+	// 1. 如果当前的 KCP 开启流模式，取出 `snd_queue` 中的最后一个报文，将其填充到mss的长度，并设置其frg为0.
+	// 对于被填充的那个包而言，仅仅是将一部分数据append到之前的数据后面，至于拆分，应该是应用层需要做的工作.
+	// 另外注意，这里只是将数据包装成segment而已，还没有走到发送，在flush中会真正构造数据包，len也是这个时候计算的
 	if kcp.stream != 0 {
 		n := len(kcp.snd_queue)
 		if n > 0 {
@@ -359,6 +396,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		}
 	}
 
+	// 2. 计算剩下的数据要分成几段
 	if len(buffer) <= int(kcp.mss) {
 		count = 1
 	} else {
@@ -373,6 +411,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		count = 1
 	}
 
+	// 3. 为剩下的数据创建KCP Segment
 	for i := 0; i < count; i++ {
 		var size int
 		if len(buffer) > int(kcp.mss) {
@@ -383,8 +422,8 @@ func (kcp *KCP) Send(buffer []byte) int {
 		seg := kcp.newSegment(size)
 		copy(seg.data, buffer[:size])
 		if kcp.stream == 0 { // message mode
-			seg.frg = uint8(count - i - 1)
-		} else { // stream mode
+			seg.frg = uint8(count - i - 1) // 发送顺序从大到小
+		} else { // stream mode, 流模式下分片编号不用填写
 			seg.frg = 0
 		}
 		kcp.snd_queue = append(kcp.snd_queue, seg)
@@ -467,13 +506,16 @@ func (kcp *KCP) parse_una(una uint32) {
 	for k := range kcp.snd_buf {
 		seg := &kcp.snd_buf[k]
 		if _itimediff(una, seg.sn) > 0 {
+			// 归还seg.data，seg.data是从sync.pool中获取的
 			kcp.delSegment(*seg)
 			count++
 		} else {
+			// snd_buf中的seg是按sn的顺序排列的
 			break
 		}
 	}
 	if count > 0 {
+		// 将数据往前移动count位，前count个数据丢弃
 		kcp.snd_buf = kcp.remove_front(kcp.snd_buf, count)
 	}
 }
@@ -483,8 +525,13 @@ func (kcp *KCP) ack_push(sn, ts uint32) {
 	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})
 }
 
+// 根据segment.sn分析当前segment与rcv_buf中的那些segment的关系
+// 1. 如果已经接收过了，则丢弃
+// 2. 否则将其按sn的顺序插入到rcv_buf中对应的位置中去
+// 3. 按顺序将sn连续在一起(通过跟rcv_nxt对比)的segment转移到rcv_queue中
 func (kcp *KCP) parse_data(newseg segment) {
 	sn := newseg.sn
+	// 窗口在调用之前已经判断过了，不会命中这个条件
 	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 ||
 		_itimediff(sn, kcp.rcv_nxt) < 0 {
 		kcp.delSegment(newseg)
@@ -494,6 +541,8 @@ func (kcp *KCP) parse_data(newseg segment) {
 	n := len(kcp.rcv_buf) - 1
 	insert_idx := 0
 	repeat := false
+	// 从后往前，seg本身就是逆序发过来的，这样更大概率循环更少
+	// 找到插入位置
 	for i := n; i >= 0; i-- {
 		seg := &kcp.rcv_buf[i]
 		if seg.sn == sn {
@@ -516,6 +565,7 @@ func (kcp *KCP) parse_data(newseg segment) {
 			kcp.rcv_buf[insert_idx] = newseg
 		}
 	} else {
+		// 重复的丢弃
 		kcp.delSegment(newseg)
 	}
 
@@ -523,6 +573,7 @@ func (kcp *KCP) parse_data(newseg segment) {
 	count := 0
 	for k := range kcp.rcv_buf {
 		seg := &kcp.rcv_buf[k]
+		// 这是这个判断保证了frg大的包一定会等到
 		if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue) < int(kcp.rcv_wnd) {
 			kcp.rcv_nxt++
 			count++
@@ -539,6 +590,7 @@ func (kcp *KCP) parse_data(newseg segment) {
 // Input when you received a low level packet (eg. UDP packet), call it
 // regular indicates a regular packet has received(not from FEC)
 func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
+	// 这个包还没有收到ack
 	snd_una := kcp.snd_una
 	if len(data) < IKCP_OVERHEAD {
 		return -1
@@ -549,6 +601,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	var flag int
 	var inSegs uint64
 
+	// data中可能有多个segment
 	for {
 		var ts, sn, length, una, conv uint32
 		var wnd uint16
@@ -569,8 +622,9 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		data = ikcp_decode16u(data, &wnd)
 		data = ikcp_decode32u(data, &ts)
 		data = ikcp_decode32u(data, &sn)
-		data = ikcp_decode32u(data, &una)
+		data = ikcp_decode32u(data, &una) // 一端的rcv_nxt就是另一端的una
 		data = ikcp_decode32u(data, &length)
+		// 如上所言，data可能不止一个seg，这里的length是第一个seg的length，所以len(data) >= int(length)
 		if len(data) < int(length) {
 			return -2
 		}
@@ -582,11 +636,15 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 
 		// only trust window updates from regular packets. i.e: latest update
 		if regular {
-			// 获得远端的窗口大小
+			// 获得远端的窗口大小，每一个包都会带有wnd，所以是实时更新的
 			kcp.rmt_wnd = uint32(wnd)
 		}
 		// 分析una，看哪些segment远端收到了，把远端收到的segment从snd_buf中移除
+		// 注意：kcp所有报文类型均带有una信息。KCP 中同时使用了 UNA 以及 ACK 编号的报文确认手段。
+		// UNA 表示此前所有的数据都已经被接收到，而 ACK 表示指定编号的数据包被接收到
 		kcp.parse_una(una)
+		// 更新kcp的una
+		// 不能直接用这个una更新kcp的snd_una，可能收到之前的包，这时候una是偏小的
 		kcp.shrink_buf()
 
 		if cmd == IKCP_CMD_ACK {
@@ -598,6 +656,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			// 因为snd_buf可能改变了，更新当前的snd_una
 			kcp.shrink_buf()
 			// 因为此时收到远端的ack，所以我们知道远端的包到本机的时间，因此可统计当前的网速如何，进行调整。这里是可以更新rto的，但是没有看到代码
+			// 补充：在691行更新
 			if flag == 0 {
 				flag = 1
 				maxack = sn
@@ -612,9 +671,11 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			// 如果还有足够多的接收窗口
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
 				// push当前包的ack给远端（会在flush中发送ack出去)
+				// 问：为什么不先判断sn与kcp.rcv_nxt的大小，再决定要不要发ack？
+				// 答：可能就是之前ack丢失导致了对端的重发，所以针对每一个包都要ack
 				kcp.ack_push(sn, ts)
 				if _itimediff(sn, kcp.rcv_nxt) >= 0 {
-					// 如果当前segment还没被接收过sn >= rcv_next
+					// 小于rcv_nxt的包肯定已经接受过了，大于的可能也接受过，下面会判断
 					seg := kcp.newSegment(int(length))
 					seg.conv = conv
 					seg.cmd = cmd
@@ -627,7 +688,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 					// 根据segment.sn分析当前segment与rcv_buf中的那些segment的关系
 					// 1. 如果已经接收过了，则丢弃
 					// 2. 否则将其按sn的顺序插入到rcv_buf中对应的位置中去
-					// 3. 按顺序将sn连续在一起的segment转移转移到rcv_queue中
+					// 3. 按顺序将sn连续在一起(通过跟rcv_nxt对比)的segment转移到rcv_queue中
 					kcp.parse_data(seg)
 				} else {
 					// 重复的包，丢弃
@@ -654,8 +715,8 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	atomic.AddUint64(&DefaultSnmp.InSegs, inSegs)
 
 	// 根据收到包头的信息，更新网络情况的统计数据，方便进行流控
-
 	if flag != 0 && regular {
+		// 根据当前收到的最大的ACK编号，在快重传的过程计算已发送的数据包被跳过的次数
 		kcp.parse_fastack(maxack)
 		current := currentMs()
 		if _itimediff(current, lastackts) >= 0 {
@@ -703,20 +764,32 @@ func (kcp *KCP) flush(ackOnly bool) {
 	var seg segment
 	seg.conv = kcp.conv
 	seg.cmd = IKCP_CMD_ACK
-	seg.wnd = kcp.wnd_unused()
+	seg.wnd = kcp.wnd_unused() // 剩余接收窗口
 	seg.una = kcp.rcv_nxt
 
+	// buffer中不会有超过一个kcp.mtu
 	buffer := kcp.buffer
 	// flush acknowledges
 	// 将前面收到数据时，压进ack发送队列的ack发送出去
 	ptr := buffer
 	for i, ack := range kcp.acklist {
 		size := len(buffer) - len(ptr)
+		// 为什么这里是加上一个IKCP_OVERHEAD来比较？
+		// 因为ack包只有header，没有body, seg.encode之后的数据大小就是一个IKCP_OVERHEAD
 		if size+IKCP_OVERHEAD > int(kcp.mtu) {
+			// 下面两行将会一直出现，需要和seg.encode(ptr)一起理解
+			// len(buffer) - len(ptr)表示的是可以发送的数据长度，在发送完毕后，ptr = buffer，将ptr指向了
+			// buffer发送的开始位置，seg.encode(ptr)，在向底层的slice（buffer）写入数据，并将ptr往后移动，
+			// 此函数执行完之后，可以保证ptr在数据的结尾处，ptr和buffer共用底层的数组。
+			// 本质上是通过seg.encode(ptr)在不停地向buffer中填充数据
 			kcp.output(buffer, size)
 			ptr = buffer
 		}
 		// filter jitters caused by bufferbloat
+		// kcp.rcv_nxt之前的包已经都收到了，但是为什么之前的ack就不发了呢？万一ack丢了呢？发送端是不是会一直
+		// 重传，然而接收端永远不会ack？
+		// 其实不然，发送方在发送时会判断窗口（下面发送的逻辑），如果窗口左边的那个包一直没有收到ack，发送方
+		// 会停止发送这个包之后的数据，只重发这个包，在这里就会走到en(kcp.acklist)-1 == i的逻辑
 		if ack.sn >= kcp.rcv_nxt || len(kcp.acklist)-1 == i {
 			seg.sn, seg.ts = ack.sn, ack.ts
 			ptr = seg.encode(ptr)
@@ -744,7 +817,7 @@ func (kcp *KCP) flush(ackOnly bool) {
 				if kcp.probe_wait < IKCP_PROBE_INIT {
 					kcp.probe_wait = IKCP_PROBE_INIT
 				}
-				kcp.probe_wait += kcp.probe_wait / 2
+				kcp.probe_wait += kcp.probe_wait / 2 // 延长探测间隔
 				if kcp.probe_wait > IKCP_PROBE_LIMIT {
 					kcp.probe_wait = IKCP_PROBE_LIMIT
 				}
@@ -758,7 +831,7 @@ func (kcp *KCP) flush(ackOnly bool) {
 	}
 
 	// flush window probing commands
-	if (kcp.probe & IKCP_ASK_SEND) != 0 {
+	if (kcp.probe & IKCP_ASK_SEND) != 0 { // 需要探测远端窗口
 		seg.cmd = IKCP_CMD_WASK
 		size := len(buffer) - len(ptr)
 		if size+IKCP_OVERHEAD > int(kcp.mtu) {
@@ -791,7 +864,8 @@ func (kcp *KCP) flush(ackOnly bool) {
 	// 转移snd_queue中的数据到snd_buf中，以便后面发送出去
 	newSegsCount := 0
 	for k := range kcp.snd_queue {
-		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 { // 已经没有发送窗口了，不发送新数据
+		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
+			// 有一个很久之前的seg未被确认，不要再发送新的包，只处理snd_buffer中现有的
 			break
 		}
 		newseg := kcp.snd_queue[k]
@@ -804,11 +878,12 @@ func (kcp *KCP) flush(ackOnly bool) {
 		kcp.snd_queue[k].data = nil
 	}
 	if newSegsCount > 0 {
+		// 前newSegsCount个seg已经发送，将后面的seg挪到前面来
 		kcp.snd_queue = kcp.remove_front(kcp.snd_queue, newSegsCount)
 	}
 
 	// calculate resent
-	// 计算重传时间
+	// 获取快速重传设置
 	resent := uint32(kcp.fastresend)
 	if kcp.fastresend <= 0 {
 		resent = 0xffffffff
@@ -849,6 +924,7 @@ func (kcp *KCP) flush(ackOnly bool) {
 			change++
 			fastRetransSegs++
 		} else if segment.fastack > 0 && newSegsCount == 0 { // early retransmit
+			// 没有新的数据(从queue->buf)需要传输，并且seg已经延迟了（比之后发送的seg慢）
 			needsend = true
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
@@ -867,13 +943,17 @@ func (kcp *KCP) flush(ackOnly bool) {
 			need := IKCP_OVERHEAD + len(segment.data)
 
 			if size+need > int(kcp.mtu) {
+				// 现有数据size加上待发数据已经超过一个kcp.mtu，先发已存在的数据，
+				// kcp保证一次发送的数据不要超过udp的mss
 				kcp.output(buffer, size)
 				current = currentMs() // time update for a blocking call
 				ptr = buffer
 			}
 
 			ptr = segment.encode(ptr)
+			// 上面的ptr已经不是以前的ptr了，他像一个指针，一步步往后挪，就和他的名字一样
 			copy(ptr, segment.data)
+			// ptr，指向数据的终点
 			ptr = ptr[len(segment.data):]
 
 			if segment.xmit >= kcp.dead_link {
@@ -936,6 +1016,9 @@ func (kcp *KCP) flush(ackOnly bool) {
 // Update updates state (call it repeatedly, every 10ms-100ms), or you can ask
 // ikcp_check when to call it again (without ikcp_input/_send calling).
 // 'current' - current timestamp in millisec.
+//
+// kcp需要上层通过update来驱动kcp数据包的发送，每次驱动的时间间隔由interval来决定，interval可以通过函数interval来设置，间隔时间在10毫秒到5秒之间，初始默认值为100毫秒。
+// 另外注意到一点是，updated参数只有在第一次调用update函数时设置为1，源码中没有找到重置为0的地方，目测就是一个标志参数，用于区别第一次驱动和之后的驱动所需要选择的时间。
 func (kcp *KCP) Update() {
 	var slap int32
 
@@ -968,6 +1051,9 @@ func (kcp *KCP) Update() {
 // Important to reduce unnacessary ikcp_update invoking. use it to
 // schedule ikcp_update (eg. implementing an epoll-like mechanism,
 // or optimize ikcp_update when handling massive kcp connections)
+//
+// check函数用于获取下次update的时间。具体的时间由上次update后更新的下次时间和snd_buf中的超时重传时间决定。
+// check过程会寻找snd_buf中是否有超时重传的数据，如果有需要重传的Segment，将返回当前时间，立即进行一次update来进行重传，如果全都不需要重传，则会根据最小的重传时间来判断下次update的时间。
 func (kcp *KCP) Check() uint32 {
 	current := currentMs()
 	ts_flush := kcp.ts_flush
@@ -1076,7 +1162,7 @@ func (kcp *KCP) WaitSnd() int {
 
 // remove front n elements from queue
 func (kcp *KCP) remove_front(q []segment, n int) []segment {
-	newn := copy(q, q[n:])
+	newn := copy(q, q[n:]) // copy返回copy数据的个数，这里是len(q[n:])
 	for i := newn; i < len(q); i++ {
 		q[i] = segment{} // manual set nil for GC
 	}

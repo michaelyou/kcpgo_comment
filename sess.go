@@ -192,7 +192,7 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp
 			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
 			if len(b) >= size { // receive data into 'b' directly
-				s.kcp.Recv(b)
+				s.kcp.Recv(b) // 从kcp.rcv_queue开始读
 				s.mu.Unlock()
 				return size, nil
 			}
@@ -258,6 +258,8 @@ func (s *UDPSession) Write(b []byte) (n int, err error) {
 		if s.kcp.WaitSnd() < int(s.kcp.snd_wnd) {
 			n = len(b)
 			for {
+				// mss可以看做一个固定值，等于(IKCP_MTU_DEF - IKCP_OVERHEAD)，也就是(1400-24)
+				// 这个mss是对于kcp而言的，网络中的数据包需要加上kcp，udp，ip头
 				if len(b) <= int(s.kcp.mss) {
 					s.kcp.Send(b)
 					break
@@ -268,7 +270,7 @@ func (s *UDPSession) Write(b []byte) (n int, err error) {
 			}
 
 			if !s.writeDelay {
-				s.kcp.flush(false)
+				s.kcp.flush(false) // flush会触发真正的写
 			}
 			s.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
@@ -610,6 +612,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 	}
 }
 
+// 从kernel读数据
 func (s *UDPSession) receiver(ch chan<- []byte) {
 	for {
 		data := xmitBuf.Get().([]byte)[:mtuLimit]
@@ -628,6 +631,9 @@ func (s *UDPSession) receiver(ch chan<- []byte) {
 	}
 }
 
+// client读和从kernel读是不能同时进行的，两者都会操作kcp.rcv_queue，所以在两这个操作上会加上udpsession的锁，
+// 分别在Read和kcpInput方法上。
+// 另外Read和Write上的锁也限制了，一个udpsession(可以认为是一个连接)不能并发读写
 // the read loop for a client session
 func (s *UDPSession) readLoop() {
 	chPacket := make(chan []byte, qlen)
@@ -653,6 +659,7 @@ func (s *UDPSession) readLoop() {
 			}
 
 			if dataValid {
+				// 准备放到kcp中处理
 				s.kcpInput(data)
 			}
 			xmitBuf.Put(raw)
