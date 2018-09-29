@@ -924,6 +924,7 @@ func (kcp *KCP) flush(ackOnly bool) {
 			change++
 			fastRetransSegs++
 		} else if segment.fastack > 0 && newSegsCount == 0 { // early retransmit
+			// tcp也有这样的机制，参考 [Early Retransmit for TCP](https://tools.ietf.org/html/rfc5827)
 			// 没有新的数据(从queue->buf)需要传输，并且seg已经延迟了（比之后发送的seg慢）
 			needsend = true
 			segment.fastack = 0
