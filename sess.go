@@ -159,6 +159,8 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	updater.addSession(sess)
 
 	if sess.l == nil { // it's a client connection
+		// 客户端起readLoop
+		// 服务端是listener.monitor
 		go sess.readLoop()
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 	} else {
@@ -678,6 +680,7 @@ type (
 		fecDecoder   *fecDecoder    // FEC mock initialization
 		conn         net.PacketConn // the underlying packet connection
 
+		// addr: *UDPSession
 		sessions        map[string]*UDPSession // all sessions accepted by this Listener
 		chAccepts       chan *UDPSession       // Listen() backlog
 		chSessionClosed chan net.Addr          // session close queue
@@ -754,12 +757,16 @@ func (l *Listener) monitor() {
 
 						if convValid { // creates a new session only if the 'conv' field in kcp is accessible
 							s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, from, l.block)
+							// 同样需要交给kcp处理
+							// 对UDP而言，不存在连接的概念，但是kcp需要创造出这个。第一次收到某个地址的包就
+							// 认为需要创建一个新的连接，但是针对这个包的处理和普通包应该是一致的(本身只是
+							// 一个普通数据包，而非tcp的3次握手)
 							s.kcpInput(data)
 							l.sessions[addr] = s
 							l.chAccepts <- s
 						}
 					}
-				} else {
+				} else { // 已建立连接上的数据，交给kcp处理
 					s.kcpInput(data)
 				}
 			}
@@ -829,7 +836,7 @@ func (l *Listener) AcceptKCP() (*UDPSession, error) {
 	select {
 	case <-timeout:
 		return nil, &errTimeout{}
-	case c := <-l.chAccepts:
+	case c := <-l.chAccepts: // 在l.monitor中初次(根据addr判断)收到的请求会创建udpsession并进入chAccepts
 		return c, nil
 	case <-l.die:
 		return nil, errors.New(errBrokenPipe)
@@ -897,7 +904,7 @@ func ServeConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 	l := new(Listener)
 	l.conn = conn
 	l.sessions = make(map[string]*UDPSession)
-	l.chAccepts = make(chan *UDPSession, acceptBacklog)
+	l.chAccepts = make(chan *UDPSession, acceptBacklog) // 同tcp backlog，accept queue的长度
 	l.chSessionClosed = make(chan net.Addr)
 	l.die = make(chan struct{})
 	l.dataShards = dataShards
